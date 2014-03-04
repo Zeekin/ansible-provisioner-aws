@@ -16,6 +16,7 @@ from ansible.module_utils.basic import *
 from ansible.module_utils.ec2 import *
 
 try:
+    from boto.ec2.blockdevicemapping import BlockDeviceType, BlockDeviceMapping
     import boto.ec2.autoscale
     from boto.ec2.autoscale import LaunchConfiguration
     from boto.exception import BotoServerError
@@ -32,24 +33,63 @@ AWS_REGIONS = ['ap-northeast-1',
                'us-west-1',
                'us-west-2']
 
+def create_block_device(module, volume):
+    # Not aware of a way to determine this programatically
+    # http://aws.amazon.com/about-aws/whats-new/2013/10/09/ebs-provisioned-iops-maximum-iops-gb-ratio-increased-to-30-1/
+    MAX_IOPS_TO_SIZE_RATIO = 30
+    if 'snapshot' not in volume and 'ephemeral' not in volume:
+        if 'volume_size' not in volume:
+            module.fail_json(msg = 'Size must be specified when creating a new volume or modifying the root volume')
+    if 'snapshot' in volume:
+        if 'device_type' in volume and volume.get('device_type') == 'io1' and 'iops' not in volume:
+            module.fail_json(msg = 'io1 volumes must have an iops value set')
+    if 'ephemeral' in volume:
+        if 'snapshot' in volume:
+            module.fail_json(msg = 'Cannot set both ephemeral and snapshot')
+    return BlockDeviceType(snapshot_id=volume.get('snapshot'),
+                           ephemeral_name=volume.get('ephemeral'),
+                           size=volume.get('volume_size'),
+                           volume_type=volume.get('device_type'),
+                           delete_on_termination=volume.get('delete_on_termination', False),
+                           iops=volume.get('iops'))
+
 
 def create_launch_config(connection, module):
     name = module.params.get('name')
     image_id = module.params.get('image_id')
     key_name = module.params.get('key_name')
     security_groups = module.params['security_groups']
+    user_data = module.params.get('user_data')
+    block_device_mappings = module.params['block_device_mappings']
+    # vpc_subnet_id = module.params.get('vpc_subnet_id')
+    instance_type = module.params.get('instance_type')
+    if block_device_mappings:
+        bdm = BlockDeviceMapping()
+        for volume in block_device_mappings:
+            if 'device_name' not in volume:
+                module.fail_json(msg = 'Device name must be set for volume')
+            # Minimum volume size is 1GB. We'll use volume size explicitly set to 0
+            # to be a signal not to create this volume
+            if 'volume_size' not in volume or int(volume['volume_size']) > 0:
+                bdm[volume['device_name']] = create_block_device(module, volume)
+
 
     lc = LaunchConfiguration(
         name=name,
         image_id=image_id,
         key_name=key_name,
-        security_groups=security_groups)
+        security_groups=security_groups,
+        user_data=user_data,
+        # vpc_subnet_id=vpc_subnet_id, 
+        block_device_mappings=[bdm],
+        instance_type=instance_type)
 
     try:
         connection.create_launch_configuration(lc)
         module.exit_json(changed=True)
     except BotoServerError, e:
         module.exit_json(changed=False, msg=str(e))
+
 
 
 def delete_launch_config(connection, module):
@@ -67,10 +107,14 @@ def main():
         argument_spec = dict(
             name = dict(required=True, type='str'),
             image_id = dict(required=True, type='str'),
-            key_name = dict(required=True, type='str'),
-            security_groups = dict(required=True, type='list'),
+            key_name = dict(type='str'),
+            security_groups = dict(type='list'),
+            user_data = dict(required=True, type='str'),
+            block_device_mappings = dict(required=True, type='list'),
+            instance_type = dict(required=True, type='str'),
             state = dict(default='present', choices=['present', 'absent']),
             region = dict(aliases=['aws_region', 'ec2_region'], choices=AWS_REGIONS),
+            # vpc_subnet_id = dict(),
             ec2_url = dict(),
             ec2_secret_key = dict(aliases=['aws_secret_key', 'secret_key'], no_log=True),
             ec2_access_key = dict(aliases=['aws_access_key', 'access_key']),
